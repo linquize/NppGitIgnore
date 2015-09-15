@@ -23,6 +23,8 @@
 
 #include "git2.h"
 #include <functional>
+#include <stack>
+#include <string>
 
 //
 // The plugin data that Notepad++ needs
@@ -143,6 +145,47 @@ public:
 			strcpy(ptr, fullPath + strlen(baseDir));
 		return ptr;
 	}
+	static const char * comparePath(const char *a, const char *b, int &behind, int &ahead)
+	{
+		behind = ahead = 0;
+		const char *c = a;
+		const char *d = b;
+		while (true)
+		{
+			if ((!*a || *a == '/') && (!*b || *b == '/'))
+			{
+				c = a + (*a ? 1 : 0);
+				d = b + (*b ? 1 : 0);
+			}
+			if (*a != *b)
+				break;
+			if (!*a || !*b)
+				break;
+			a++;
+			b++;
+		}
+
+		b = d;
+		if (*b)
+		{
+			for (; *b; b++)
+				if (*b == '/')
+					ahead++;
+			if (*(b - 1) != '/')
+				ahead++;
+		}
+
+		a = c;
+		if (*a)
+		{
+			for (; *a; a++)
+				if (*a == '/')
+					behind++;
+			if (*(a - 1) != '/')
+				behind++;
+		}
+		return d;
+	}
 	operator char *() { return ptr; }
 };
 
@@ -168,8 +211,29 @@ void toForwardSlash(char *buf)
 	}
 }
 
+std::stack<std::pair<std::string, git_repository *> > repoCache;
+
+void clearRepoCache(int count = INT_MAX)
+{
+	int c = 0;
+	git_repository *repo = nullptr;
+	while (!repoCache.empty())
+	{
+		auto item = repoCache.top();
+		if (item.second != repo)
+			git_repository_free(repo);
+		if (c >= count)
+			return;
+		repo = item.second;
+		repoCache.pop();
+		c++;
+	}
+	git_repository_free(repo);
+}
+
 void onFindFilesStarted(SCNotification *notifyCode)
 {
+	clearRepoCache();
 }
 
 void onFindFilesFile(SCNotification *notifyCode)
@@ -177,21 +241,47 @@ void onFindFilesFile(SCNotification *notifyCode)
 	auto input = (std::pair<const TCHAR *, const TCHAR *>*)notifyCode->nmhdr.hwndFrom;
 	auto result = (bool*)notifyCode->nmhdr.idFrom;
 
-	git_buf repoPath = { 0 };
 	Utf16ToUtf8 discover;
 	discover.convert(input->first);
 	toForwardSlash(discover);
-	int r;
-	if ((r = git_repository_discover(&repoPath, discover, 1, nullptr)) < 0)
-		return;
-	AutoVar var1([&]() { git_buf_free(&repoPath); });
-
+	bool found = false;
 	git_repository *repo = nullptr;
-	if ((r = git_repository_open(&repo, repoPath.ptr)) < 0)
+	int behind = 0, ahead = 0;
+	int r;
+	const char *oldDir = "";
+	if (!repoCache.empty())
+		oldDir = repoCache.top().first.c_str();
+	const char *extra = RelativePath::comparePath(oldDir, discover, behind, ahead);
+	if (behind > 0)
+	{
+		// go to parent
+		clearRepoCache(behind);
+		if (!repoCache.empty())
+		{
+			found = true;
+			repo = repoCache.top().second;
+		}
+	}
+	while (ahead > 0)
+	{
+		git_buf repoPath = { 0 };
+		if ((r = git_repository_discover(&repoPath, discover, 1, nullptr)) >= 0)
+			if ((r = git_repository_open(&repo, repoPath.ptr)) >= 0)
+			{
+				
+			}
+		repoCache.push(std::make_pair((char *)discover, repo));
+		ahead--;
+	}
+
+	if (!repo)
 		return;
-	AutoVar var2([&]() { git_repository_free(repo); });
+
+	//AutoVar var2([&]() { git_repository_free(repo); });
 
 	const char *workdir = git_repository_workdir(repo);
+	if (!workdir)
+		return;
 	Utf16ToUtf8 file;
 	RelativePath relative;
 	relative.make(workdir, discover);
@@ -206,4 +296,5 @@ void onFindFilesFile(SCNotification *notifyCode)
 
 void onFindFilesEnded(SCNotification *notifyCode)
 {
+	clearRepoCache();
 }
